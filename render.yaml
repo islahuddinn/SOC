@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: support-ops-console
+    runtime: node
+    buildCommand: npm install && npm run build -w shared && npm run build -w frontend && npm run build -w backend
+    startCommand: npm run migrate -w backend && npm run seed -w backend && npm run start -w backend
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: support-ops-db
+          property: connectionString
+
+databases:
+  - name: support-ops-db
+    plan: free
