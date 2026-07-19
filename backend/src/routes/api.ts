@@ -7,8 +7,11 @@ import {
   getEscalationDetail,
   getPendingEscalations,
   getRefunds,
+  getDashboardStats,
+  getOrders,
 } from '../services/supportService';
 import { executeApprovedEscalation, rejectEscalation } from '../services/actionExecutor';
+import { getAvailableProviders, getLlmConfig } from '../llm/provider';
 
 const createRequestSchema = z.object({
   customer_email: z.string().email(),
@@ -26,8 +29,44 @@ const rejectSchema = z.object({
 
 export const apiRouter = Router();
 
-apiRouter.get('/health', (_req: Request, res: Response) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+apiRouter.get('/health', async (_req: Request, res: Response) => {
+  try {
+    await poolHealthCheck();
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  } catch {
+    res.status(503).json({ status: 'degraded', timestamp: new Date().toISOString() });
+  }
+});
+
+async function poolHealthCheck(): Promise<void> {
+  const { pool } = await import('../db/pool');
+  await pool.query('SELECT 1');
+}
+
+apiRouter.get('/config', (_req: Request, res: Response) => {
+  const llm = getLlmConfig();
+  res.json({
+    llm,
+    providers: getAvailableProviders(),
+  });
+});
+
+apiRouter.get('/stats', async (_req: Request, res: Response) => {
+  try {
+    const stats = await getDashboardStats();
+    res.json(stats);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Internal error' });
+  }
+});
+
+apiRouter.get('/orders', async (_req: Request, res: Response) => {
+  try {
+    const orders = await getOrders();
+    res.json(orders);
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Internal error' });
+  }
 });
 
 apiRouter.post('/support-requests', async (req: Request, res: Response) => {
@@ -40,7 +79,7 @@ apiRouter.post('/support-requests', async (req: Request, res: Response) => {
 
     const { customer_email, message } = parsed.data;
     const result = await createSupportRequest(customer_email, message);
-    res.status(201).json(result);
+    res.status(202).json(result);
   } catch (err) {
     console.error('Create support request error:', err);
     res.status(500).json({ error: err instanceof Error ? err.message : 'Internal error' });
@@ -59,6 +98,10 @@ apiRouter.get('/queue', async (_req: Request, res: Response) => {
 apiRouter.get('/support-requests/:id', async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
+    if (Number.isNaN(id)) {
+      res.status(400).json({ error: 'Invalid id' });
+      return;
+    }
     const detail = await getSupportRequestDetail(id);
     if (!detail) {
       res.status(404).json({ error: 'Not found' });
@@ -82,6 +125,10 @@ apiRouter.get('/escalations/pending', async (_req: Request, res: Response) => {
 apiRouter.get('/escalations/:id', async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
+    if (Number.isNaN(id)) {
+      res.status(400).json({ error: 'Invalid id' });
+      return;
+    }
     const detail = await getEscalationDetail(id);
     if (!detail) {
       res.status(404).json({ error: 'Not found' });

@@ -1,39 +1,22 @@
-import { useCallback, useEffect, useState } from 'react';
-import { useParams } from 'react-router-dom';
-import { api, type EscalationDetail } from '../api';
+import { useCallback, useState } from 'react';
+import { Link, useParams } from 'react-router-dom';
+import { ApiClientError, api } from '../api';
+import { usePolling } from '../hooks/usePolling';
+import { formatMoney } from '../utils/display';
 
 export default function EscalationPage() {
   const { id } = useParams<{ id: string }>();
   const escalationId = Number(id);
-  const [detail, setDetail] = useState<EscalationDetail | null>(null);
   const [reviewer, setReviewer] = useState('reviewer-1');
   const [rejectReason, setRejectReason] = useState('');
   const [actionResult, setActionResult] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    try {
-      const data = await api.getEscalation(escalationId);
-      setDetail(data);
-      setError(null);
-
-      if (data.escalation.status !== 'pending') {
-        setActionResult({
-          type: 'info',
-          message: `Escalation is ${data.escalation.status}${data.escalation.approved_by ? ` by ${data.escalation.approved_by}` : ''}.`,
-        });
-      }
-    } catch (err) {
-      setError('Failed to load escalation');
-    }
-  }, [escalationId]);
-
-  useEffect(() => {
-    load();
-    const interval = setInterval(load, 2000);
-    return () => clearInterval(interval);
-  }, [load]);
+  const fetcher = useCallback(() => api.getEscalation(escalationId), [escalationId]);
+  const { data: detail, error, lastUpdated, refresh } = usePolling(fetcher, {
+    intervalMs: 2000,
+    enabled: !Number.isNaN(escalationId),
+  });
 
   const isPending = detail?.escalation.status === 'pending';
 
@@ -42,21 +25,18 @@ export default function EscalationPage() {
     setActionResult(null);
     try {
       const result = await api.approveEscalation(escalationId, reviewer);
-      if (result.success) {
-        setActionResult({ type: 'success', message: result.message });
-      } else {
-        setActionResult({ type: 'error', message: result.message });
-      }
-      await load();
-    } catch (err: unknown) {
-      const e = err as { message?: string; status?: number };
       setActionResult({
-        type: 'error',
-        message: e.message || 'Approval failed — escalation may have been handled by another reviewer.',
+        type: result.success ? 'success' : 'error',
+        message: result.message,
       });
-      await load();
+    } catch (err) {
+      const msg = err instanceof ApiClientError
+        ? (err.data as { message?: string })?.message || err.message
+        : 'Approval failed — another reviewer may have acted first.';
+      setActionResult({ type: 'error', message: msg });
     } finally {
       setLoading(false);
+      await refresh();
     }
   }
 
@@ -69,20 +49,16 @@ export default function EscalationPage() {
     setActionResult(null);
     try {
       const result = await api.rejectEscalation(escalationId, reviewer, rejectReason);
-      setActionResult({
-        type: result.success ? 'success' : 'error',
-        message: result.message,
-      });
-      await load();
-    } catch (err: unknown) {
-      const e = err as { message?: string };
-      setActionResult({ type: 'error', message: e.message || 'Rejection failed.' });
-      await load();
+      setActionResult({ type: result.success ? 'success' : 'error', message: result.message });
+    } catch (err) {
+      setActionResult({ type: 'error', message: err instanceof Error ? err.message : 'Rejection failed.' });
     } finally {
       setLoading(false);
+      await refresh();
     }
   }
 
+  if (Number.isNaN(escalationId)) return <div className="alert alert-error">Invalid escalation ID</div>;
   if (error) return <div className="alert alert-error">{error}</div>;
   if (!detail) return <div className="card">Loading escalation…</div>;
 
@@ -90,11 +66,26 @@ export default function EscalationPage() {
 
   return (
     <div>
-      <h2>Escalation Review #{escalation.id}</h2>
+      <div className="page-header">
+        <div>
+          <h2>Escalation Review #{escalation.id}</h2>
+          <p className="meta">
+            Request <Link to={`/requests/${supportRequest.id}`}>#{supportRequest.id}</Link>
+          </p>
+        </div>
+        {lastUpdated && <span className="polling-indicator">Live · {lastUpdated.toLocaleTimeString()}</span>}
+      </div>
 
       {actionResult && (
         <div className={`alert alert-${actionResult.type === 'success' ? 'success' : actionResult.type === 'error' ? 'error' : 'info'}`}>
           {actionResult.message}
+        </div>
+      )}
+
+      {!isPending && (
+        <div className="alert alert-info">
+          Status: <strong>{escalation.status}</strong>
+          {escalation.approved_by && ` · by ${escalation.approved_by}`}
         </div>
       )}
 
@@ -103,20 +94,17 @@ export default function EscalationPage() {
           <h3>Customer Request</h3>
           <p><strong>From:</strong> {supportRequest.customer_email}</p>
           <p><strong>Message:</strong> {supportRequest.message}</p>
-          <p className="meta">Request #{supportRequest.id} · {new Date(supportRequest.created_at).toLocaleString()}</p>
         </div>
-
         <div className="card">
           <h3>Proposed Action</h3>
           <p><strong>Type:</strong> {escalation.action_type.toUpperCase()}</p>
           {escalation.order_id && <p><strong>Order:</strong> #{escalation.order_id}</p>}
           {escalation.proposed_amount != null && (
-            <p><strong>Amount:</strong> ${Number(escalation.proposed_amount).toFixed(2)}</p>
+            <p><strong>Amount:</strong> {formatMoney(escalation.proposed_amount)}</p>
           )}
           <p><strong>Reason:</strong> {escalation.reason}</p>
-          <p><strong>Status:</strong> <span className={`badge badge-${escalation.status === 'pending' ? 'pending' : 'completed'}`}>{escalation.status}</span></p>
           {escalation.execution_error && (
-            <p className="alert alert-error" style={{ marginTop: '0.5rem' }}>{escalation.execution_error}</p>
+            <p className="alert alert-error">{escalation.execution_error}</p>
           )}
         </div>
       </div>
@@ -125,9 +113,7 @@ export default function EscalationPage() {
         <h3>Agent Reasoning</h3>
         <p>{escalation.agent_reasoning}</p>
         {agentRuns.map((run) => (
-          <div key={run.id} className="meta">
-            Run #{run.id} · {run.decision} · {run.reasoning_summary?.slice(0, 200)}
-          </div>
+          <p key={run.id} className="meta">Run #{run.id} · {run.decision} · {run.model}</p>
         ))}
       </div>
 
@@ -136,30 +122,28 @@ export default function EscalationPage() {
           <h3>Order Information</h3>
           <p><strong>Customer:</strong> {order.customer_name} ({order.customer_email})</p>
           <p><strong>Status:</strong> {order.status}</p>
-          <p><strong>Total:</strong> ${Number(order.total_amount).toFixed(2)}</p>
-          <p><strong>Refunded:</strong> ${Number(order.refunded_amount).toFixed(2)}</p>
-          <p><strong>Remaining refundable:</strong> ${(Number(order.total_amount) - Number(order.refunded_amount)).toFixed(2)}</p>
-          {order.shipped_at && <p><strong>Shipped:</strong> {new Date(order.shipped_at).toLocaleString()}</p>}
-          <table style={{ marginTop: '0.75rem' }}>
-            <thead>
-              <tr><th>Product</th><th>Qty</th><th>Price</th></tr>
-            </thead>
-            <tbody>
-              {orderItems.map((item, i) => (
-                <tr key={i}>
-                  <td>{item.product_name}</td>
-                  <td>{item.quantity}</td>
-                  <td>${Number(item.unit_price).toFixed(2)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <p><strong>Total:</strong> {formatMoney(order.total_amount)}</p>
+          <p><strong>Refunded:</strong> {formatMoney(order.refunded_amount)}</p>
+          <p><strong>Remaining refundable:</strong> {formatMoney(order.total_amount - order.refunded_amount)}</p>
+          <div className="table-scroll">
+            <table>
+              <thead><tr><th>Product</th><th>Qty</th><th>Price</th></tr></thead>
+              <tbody>
+                {orderItems.map((item) => (
+                  <tr key={item.id}>
+                    <td>{item.product_name}</td>
+                    <td>{item.quantity}</td>
+                    <td>{formatMoney(item.unit_price)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
       <div className="card">
         <h3>Tool Call Trace</h3>
-        {toolCalls.length === 0 && <p className="meta">No tool calls recorded.</p>}
         {toolCalls.map((tc) => (
           <div key={tc.id} className="tool-call">
             <strong>{tc.tool_name}</strong>
@@ -170,18 +154,18 @@ export default function EscalationPage() {
       </div>
 
       {isPending && (
-        <div className="card">
+        <div className="card review-actions">
           <h3>Reviewer Action</h3>
           <div className="form-group">
-            <label>Reviewer ID (use different IDs in two browser sessions to test concurrency)</label>
+            <label>Reviewer ID (use different IDs in two sessions to test concurrency)</label>
             <input value={reviewer} onChange={(e) => setReviewer(e.target.value)} />
           </div>
-          <div className="actions">
+          <div className="actions actions-wrap">
             <button className="btn btn-primary" onClick={handleApprove} disabled={loading}>
               Approve & Execute
             </button>
           </div>
-          <div className="form-group" style={{ marginTop: '1rem' }}>
+          <div className="form-group">
             <label>Rejection reason</label>
             <textarea rows={2} value={rejectReason} onChange={(e) => setRejectReason(e.target.value)} />
           </div>

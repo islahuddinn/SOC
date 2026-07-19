@@ -1,12 +1,18 @@
 services:
   - type: web
     name: support-ops-console
-    runtime: node
-    buildCommand: npm install && npm run build -w shared && npm run build -w frontend && npm run build -w backend
-    startCommand: npm run migrate -w backend && npm run seed -w backend && npm run start -w backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: LLM_PROVIDER
+        value: groq
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
       - key: OPENAI_API_KEY
         sync: false
       - key: DATABASE_URL

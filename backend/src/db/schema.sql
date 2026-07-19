@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS escalations (
   id SERIAL PRIMARY KEY,
   support_request_id INTEGER NOT NULL REFERENCES support_requests(id) ON DELETE CASCADE,
   agent_run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
-  action_type VARCHAR(50) NOT NULL CHECK (action_type IN ('refund', 'cancel', 'replacement')),
+  action_type VARCHAR(50) NOT NULL CHECK (action_type IN ('refund', 'cancel', 'replacement', 'general')),
   order_id INTEGER REFERENCES orders(id),
   proposed_amount NUMERIC(12, 2),
   reason TEXT NOT NULL,
