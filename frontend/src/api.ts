@@ -1,30 +1,59 @@
 import type {
+  AppConfig,
+  CreateSupportRequestResponse,
+  DashboardStats,
   Escalation,
+  EscalationDetail,
+  Order,
   QueueItem,
+  RefundRecord,
   SupportRequestDetail,
 } from '@soc/shared';
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
-async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${url}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw { status: res.status, ...data };
+export class ApiClientError extends Error {
+  status: number;
+  data: unknown;
+
+  constructor(status: number, data: unknown) {
+    super(typeof data === 'object' && data !== null && 'message' in data
+      ? String((data as { message: string }).message)
+      : `Request failed (${status})`);
+    this.status = status;
+    this.data = data;
   }
-  return data as T;
+}
+
+async function fetchJson<T>(url: string, options?: RequestInit): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+
+  try {
+    const res = await fetch(`${API_BASE}${url}`, {
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      ...options,
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new ApiClientError(res.status, data);
+    return data as T;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export const api = {
+  getConfig: () => fetchJson<AppConfig>('/config'),
+  getStats: () => fetchJson<DashboardStats>('/stats'),
+  getOrders: () => fetchJson<Order[]>('/orders'),
   getQueue: () => fetchJson<QueueItem[]>('/queue'),
   getSupportRequest: (id: number) => fetchJson<SupportRequestDetail>(`/support-requests/${id}`),
   getEscalation: (id: number) => fetchJson<EscalationDetail>(`/escalations/${id}`),
   getPendingEscalations: () => fetchJson<Escalation[]>('/escalations/pending'),
   createSupportRequest: (customer_email: string, message: string) =>
-    fetchJson<{ request: QueueItem; agentResult: unknown }>('/support-requests', {
+    fetchJson<CreateSupportRequestResponse>('/support-requests', {
       method: 'POST',
       body: JSON.stringify({ customer_email, message }),
     }),
@@ -38,22 +67,5 @@ export const api = {
       `/escalations/${id}/reject`,
       { method: 'POST', body: JSON.stringify({ reviewer, reason }) }
     ),
-  getRefunds: () => fetchJson<unknown[]>('/refunds'),
+  getRefunds: () => fetchJson<RefundRecord[]>('/refunds'),
 };
-
-export interface EscalationDetail {
-  escalation: Escalation;
-  supportRequest: SupportRequestDetail;
-  agentRuns: SupportRequestDetail['agent_runs'];
-  toolCalls: SupportRequestDetail['tool_calls'];
-  order: {
-    id: number;
-    customer_email: string;
-    customer_name: string;
-    status: string;
-    total_amount: number;
-    refunded_amount: number;
-    shipped_at: string | null;
-  } | null;
-  orderItems: Array<{ product_name: string; quantity: number; unit_price: number }>;
-}

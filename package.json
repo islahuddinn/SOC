@@ -8,9 +8,9 @@
     "shared"
   ],
   "scripts": {
-    "dev": "concurrently \"npm run dev -w backend\" \"npm run dev -w frontend\"",
-    "build": "npm run build -w shared && npm run build -w backend && npm run build -w frontend",
-    "start": "npm run start -w backend",
+    "dev": "node api.js && concurrently \"npm run dev -w backend\" \"npm run dev -w frontend\"",
+    "build": "node api.js && npm run build -w shared && npm run build -w backend && npm run build -w frontend",
+    "start": "node api.js && npm run start -w backend",
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
     "db:migrate": "npm run migrate -w backend",

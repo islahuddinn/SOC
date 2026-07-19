@@ -21,14 +21,6 @@ export interface ExecutionResult {
   refundId?: number;
 }
 
-/**
- * Execute a refund with database-level concurrency safety.
- *
- * Uses SELECT FOR UPDATE on the order row + unique partial index on pending refunds
- * to ensure exactly one concurrent refund succeeds.
- *
- * Guardrails are re-validated here — never trust the LLM or prior checks alone.
- */
 export async function executeRefund(input: ExecuteRefundInput): Promise<ExecutionResult> {
   const client = await pool.connect();
   try {
@@ -40,15 +32,16 @@ export async function executeRefund(input: ExecuteRefundInput): Promise<Executio
       return { success: false, message: `Order ${input.orderId} not found.` };
     }
 
+    const row = orderResult.rows[0];
     const order = {
-      id: Number(orderResult.rows[0].id),
-      customer_email: String(orderResult.rows[0].customer_email),
-      customer_name: String(orderResult.rows[0].customer_name),
-      status: orderResult.rows[0].status,
-      total_amount: Number(orderResult.rows[0].total_amount),
-      refunded_amount: Number(orderResult.rows[0].refunded_amount),
-      shipped_at: orderResult.rows[0].shipped_at,
-      created_at: String(orderResult.rows[0].created_at),
+      id: Number(row.id),
+      customer_email: String(row.customer_email),
+      customer_name: String(row.customer_name),
+      status: row.status,
+      total_amount: Number(row.total_amount),
+      refunded_amount: Number(row.refunded_amount),
+      shipped_at: row.shipped_at,
+      created_at: String(row.created_at),
     };
 
     const guardrail = validateRefund({
@@ -89,14 +82,10 @@ export async function executeRefund(input: ExecuteRefundInput): Promise<Executio
       return { success: false, message: 'Refund would exceed order total. Transaction rolled back.' };
     }
 
-    await client.query(
-      `UPDATE orders SET refunded_amount = $1 WHERE id = $2`,
-      [newRefunded, input.orderId]
-    );
-
+    await client.query(`UPDATE orders SET refunded_amount = $1 WHERE id = $2`, [newRefunded, input.orderId]);
     await client.query(`UPDATE refunds SET status = 'completed' WHERE id = $1`, [refundId]);
-
     await client.query('COMMIT');
+
     return {
       success: true,
       message: `Refund of $${input.amount.toFixed(2)} processed for order ${input.orderId}.`,
@@ -110,7 +99,6 @@ export async function executeRefund(input: ExecuteRefundInput): Promise<Executio
   }
 }
 
-/** Execute order cancellation with guardrail re-validation. */
 export async function executeCancellation(input: ExecuteCancelInput): Promise<ExecutionResult> {
   const client = await pool.connect();
   try {
@@ -168,10 +156,12 @@ export async function executeApprovedEscalation(
   approvedBy: string
 ): Promise<ExecutionResult> {
   const client = await pool.connect();
+  let escalation: Record<string, unknown>;
+  let requesterEmail: string;
+
   try {
     await client.query('BEGIN');
 
-    // Optimistic concurrency: only one approver wins
     const escResult = await client.query(
       `UPDATE escalations
        SET status = 'approved', approved_by = $2, approved_at = NOW(), updated_at = NOW()
@@ -196,60 +186,61 @@ export async function executeApprovedEscalation(
       return { success: false, message: 'Escalation is no longer pending approval.' };
     }
 
-    const escalation = escResult.rows[0];
+    escalation = escResult.rows[0];
     const supportRequest = await client.query(
       'SELECT customer_email FROM support_requests WHERE id = $1',
       [escalation.support_request_id]
     );
-    const requesterEmail = String(supportRequest.rows[0].customer_email);
+    requesterEmail = String(supportRequest.rows[0].customer_email);
 
     await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
     client.release();
+  }
 
-    let result: ExecutionResult;
+  let result: ExecutionResult;
+  const actionType = String(escalation.action_type);
+  const orderId = escalation.order_id != null ? Number(escalation.order_id) : null;
 
-    if (escalation.action_type === 'refund') {
+  if (actionType === 'refund') {
+    if (orderId == null) {
+      result = { success: false, message: 'Refund escalation missing order ID.' };
+    } else {
       result = await executeRefund({
-        orderId: Number(escalation.order_id),
+        orderId,
         amount: Number(escalation.proposed_amount),
         requesterEmail,
         escalationId,
         supportRequestId: Number(escalation.support_request_id),
       });
-    } else if (escalation.action_type === 'cancel') {
-      result = await executeCancellation({
-        orderId: Number(escalation.order_id),
-        requesterEmail,
-        escalationId,
-      });
+    }
+  } else if (actionType === 'cancel') {
+    if (orderId == null) {
+      result = { success: false, message: 'Cancellation escalation missing order ID.' };
     } else {
-      result = { success: true, message: 'Replacement approved. Fulfillment team notified.' };
+      result = await executeCancellation({ orderId, requesterEmail, escalationId });
     }
-
-    const updateClient = await pool.connect();
-    try {
-      await updateClient.query(
-        `UPDATE escalations
-         SET status = $2, executed_at = CASE WHEN $3 THEN NOW() ELSE NULL END,
-             execution_error = $4, updated_at = NOW()
-         WHERE id = $1`,
-        [
-          escalationId,
-          result.success ? 'executed' : 'failed',
-          result.success,
-          result.success ? null : result.message,
-        ]
-      );
-    } finally {
-      updateClient.release();
-    }
-
-    return result;
-  } catch (err) {
-    await client.query('ROLLBACK');
-    client.release();
-    throw err;
+  } else {
+    result = {
+      success: true,
+      message: actionType === 'replacement'
+        ? 'Replacement approved. Fulfillment team notified.'
+        : 'Escalation approved. Manual follow-up recorded.',
+    };
   }
+
+  await pool.query(
+    `UPDATE escalations
+     SET status = $2, executed_at = CASE WHEN $3 THEN NOW() ELSE NULL END,
+         execution_error = $4, updated_at = NOW()
+     WHERE id = $1`,
+    [escalationId, result.success ? 'executed' : 'failed', result.success, result.success ? null : result.message]
+  );
+
+  return result;
 }
 
 export async function rejectEscalation(

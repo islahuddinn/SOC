@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../api';
 
 const EXAMPLES = [
@@ -13,18 +14,42 @@ export default function NewRequestPage() {
   const [email, setEmail] = useState('alice@example.com');
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<string | null>(null);
+  const [requestId, setRequestId] = useState<number | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!requestId) return;
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const detail = await api.getSupportRequest(requestId);
+        if (cancelled) return;
+        setStatus(detail.status);
+        if (detail.status === 'processing' || detail.status === 'received') {
+          window.setTimeout(poll, 2000);
+        }
+      } catch {
+        if (!cancelled) setError('Failed to poll request status');
+      }
+    };
+
+    poll();
+    return () => { cancelled = true; };
+  }, [requestId]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
     setError(null);
-    setResult(null);
+    setRequestId(null);
+    setStatus(null);
+
     try {
       const data = await api.createSupportRequest(email, message);
-      const agent = data.agentResult as { decision?: string; outcome?: string };
-      setResult(`Request #${data.request.id} created. Agent decision: ${agent.decision}. ${agent.outcome || ''}`);
+      setRequestId(data.request.id);
+      setStatus(data.request.status);
       setMessage('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to submit request');
@@ -35,25 +60,39 @@ export default function NewRequestPage() {
 
   return (
     <div>
-      <h2>Submit Support Request</h2>
-      <p className="meta">The AI agent will process this request using a tool-calling loop. Refunds and replacements escalate to human review.</p>
+      <div className="page-header">
+        <div>
+          <h2>Submit Support Request</h2>
+          <p className="meta">Agent processes asynchronously — no HTTP timeout on long LLM runs</p>
+        </div>
+      </div>
 
-      {result && <div className="alert alert-success">{result}</div>}
+      {requestId && (
+        <div className={`alert ${status === 'failed' ? 'alert-error' : status === 'processing' ? 'alert-info' : 'alert-success'}`}>
+          Request #{requestId} — status: <strong>{status}</strong>
+          {status === 'processing' && ' (agent working…)'}
+          {status && status !== 'processing' && (
+            <> · <Link to={`/requests/${requestId}`}>View full trace</Link></>
+          )}
+        </div>
+      )}
       {error && <div className="alert alert-error">{error}</div>}
 
       <div className="card">
         <h3>Example Requests</h3>
-        {EXAMPLES.map((ex, i) => (
-          <button
-            key={i}
-            type="button"
-            className="btn btn-secondary"
-            style={{ display: 'block', width: '100%', marginBottom: '0.5rem', textAlign: 'left' }}
-            onClick={() => { setEmail(ex.email); setMessage(ex.message); }}
-          >
-            <strong>{ex.email}</strong>: {ex.message}
-          </button>
-        ))}
+        <div className="example-grid">
+          {EXAMPLES.map((ex, i) => (
+            <button
+              key={i}
+              type="button"
+              className="example-btn"
+              onClick={() => { setEmail(ex.email); setMessage(ex.message); }}
+            >
+              <strong>{ex.email}</strong>
+              <span>{ex.message}</span>
+            </button>
+          ))}
+        </div>
       </div>
 
       <form className="card" onSubmit={submit}>
@@ -66,7 +105,7 @@ export default function NewRequestPage() {
           <textarea rows={4} value={message} onChange={(e) => setMessage(e.target.value)} required />
         </div>
         <button className="btn btn-primary" type="submit" disabled={loading}>
-          {loading ? 'Agent processing…' : 'Submit Request'}
+          {loading ? 'Submitting…' : 'Submit Request'}
         </button>
       </form>
     </div>

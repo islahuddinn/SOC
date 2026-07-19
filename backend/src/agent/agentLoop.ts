@@ -1,97 +1,10 @@
-import type { ChatCompletionMessageParam, ChatCompletionTool } from 'openai/resources/chat/completions';
-import OpenAI from 'openai';
+import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
 import { pool } from '../db/pool';
 import { getOrderWithItems, getOrdersByEmail } from '../services/orderService';
 import { validateRefund, validateCancellation, validateReplacement } from '../guardrails';
-import { executeRefund, executeCancellation } from '../services/actionExecutor';
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-export const AGENT_TOOLS: ChatCompletionTool[] = [
-  {
-    type: 'function',
-    function: {
-      name: 'lookup_order',
-      description: 'Look up an order by ID. Returns order details and line items. Use to verify order exists before taking action.',
-      parameters: {
-        type: 'object',
-        properties: {
-          order_id: { type: 'number', description: 'The order ID to look up' },
-        },
-        required: ['order_id'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'list_customer_orders',
-      description: 'List all orders for the requesting customer email.',
-      parameters: { type: 'object', properties: {}, required: [] },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'request_refund',
-      description: 'Request a refund for an order. May auto-execute or escalate based on guardrails and policy.',
-      parameters: {
-        type: 'object',
-        properties: {
-          order_id: { type: 'number' },
-          amount: { type: 'number', description: 'Refund amount in dollars' },
-          reason: { type: 'string', description: 'Reason for the refund' },
-        },
-        required: ['order_id', 'amount', 'reason'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'request_cancellation',
-      description: 'Request cancellation of an order that has not shipped.',
-      parameters: {
-        type: 'object',
-        properties: {
-          order_id: { type: 'number' },
-          reason: { type: 'string' },
-        },
-        required: ['order_id', 'reason'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'request_replacement',
-      description: 'Request a replacement for damaged or defective items. Always escalates to human review.',
-      parameters: {
-        type: 'object',
-        properties: {
-          order_id: { type: 'number' },
-          reason: { type: 'string' },
-        },
-        required: ['order_id', 'reason'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'escalate_to_human',
-      description: 'Escalate the request to a human reviewer when you cannot resolve automatically or policy requires it.',
-      parameters: {
-        type: 'object',
-        properties: {
-          reason: { type: 'string', description: 'Why human review is needed' },
-          summary: { type: 'string', description: 'Summary of the situation for the reviewer' },
-        },
-        required: ['reason', 'summary'],
-      },
-    },
-  },
-];
+import { executeCancellation } from '../services/actionExecutor';
+import { createChatCompletion, getLlmConfig } from '../llm/provider';
+import { AGENT_TOOLS, SYSTEM_PROMPT } from '../llm/tools';
 
 interface ToolContext {
   supportRequestId: number;
@@ -113,8 +26,8 @@ async function recordToolCall(
 
 async function createEscalation(
   ctx: ToolContext,
-  actionType: 'refund' | 'cancel' | 'replacement',
-  orderId: number,
+  actionType: 'refund' | 'cancel' | 'replacement' | 'general',
+  orderId: number | null,
   reason: string,
   agentReasoning: string,
   proposedAmount: number | null
@@ -137,7 +50,7 @@ async function createEscalation(
       success: true,
       escalated: true,
       escalation_id: result.rows[0].id,
-      message: `Escalated ${actionType} for order ${orderId} to human reviewer.`,
+      message: `Escalated ${actionType}${orderId ? ` for order ${orderId}` : ''} to human reviewer.`,
     };
   } catch (err: unknown) {
     const pgErr = err as { code?: string };
@@ -178,7 +91,7 @@ export async function executeTool(
           customer_name: isOwner ? data.order.customer_name : '[redacted]',
         },
         items: isOwner
-          ? data.items.map((i: { product_name: string; quantity: number; unit_price: number }) => ({ product: i.product_name, qty: i.quantity, price: i.unit_price }))
+          ? data.items.map((i) => ({ product: i.product_name, qty: i.quantity, price: i.unit_price }))
           : [],
         access_denied: !isOwner ? 'This order belongs to another customer.' : undefined,
       };
@@ -187,7 +100,7 @@ export async function executeTool(
     case 'list_customer_orders': {
       const orders = await getOrdersByEmail(ctx.customerEmail);
       return {
-        orders: orders.map((o: { id: number; status: string; total_amount: number; refunded_amount: number; shipped_at: string | null }) => ({
+        orders: orders.map((o) => ({
           id: o.id,
           status: o.status,
           total: o.total_amount,
@@ -217,8 +130,7 @@ export async function executeTool(
         return { success: false, blocked_by_guardrail: true, reason: guardrail.reason };
       }
 
-      // Store policy: refunds always escalate
-      const result = await createEscalation(
+      return createEscalation(
         ctx,
         'refund',
         orderId,
@@ -226,7 +138,6 @@ export async function executeTool(
         `Agent requested refund of $${amount.toFixed(2)}: ${reason}`,
         amount
       );
-      return result;
     }
 
     case 'request_cancellation': {
@@ -248,17 +159,9 @@ export async function executeTool(
       }
 
       if (guardrail.requiresEscalation) {
-        return createEscalation(
-          ctx,
-          'cancel',
-          orderId,
-          reason,
-          `Agent requested cancellation: ${reason}`,
-          null
-        );
+        return createEscalation(ctx, 'cancel', orderId, reason, `Agent requested cancellation: ${reason}`, null);
       }
 
-      // Auto-execute safe unshipped cancellations
       const execResult = await executeCancellation({
         orderId,
         requesterEmail: ctx.customerEmail,
@@ -293,36 +196,18 @@ export async function executeTool(
         return { success: false, blocked_by_guardrail: true, reason: guardrail.reason };
       }
 
-      return createEscalation(
-        ctx,
-        'replacement',
-        orderId,
-        reason,
-        `Agent requested replacement: ${reason}`,
-        null
-      );
+      return createEscalation(ctx, 'replacement', orderId, reason, `Agent requested replacement: ${reason}`, null);
     }
 
     case 'escalate_to_human': {
-      const result = await pool.query(
-        `INSERT INTO escalations
-         (support_request_id, agent_run_id, action_type, order_id, reason, agent_reasoning, status)
-         VALUES ($1, $2, 'replacement', NULL, $3, $4, 'pending')
-         RETURNING id`,
-        [ctx.supportRequestId, ctx.agentRunId, String(args.reason), String(args.summary)]
+      return createEscalation(
+        ctx,
+        'general',
+        null,
+        String(args.reason),
+        String(args.summary),
+        null
       );
-
-      await pool.query(
-        `UPDATE support_requests SET status = 'escalated', outcome = $2, updated_at = NOW() WHERE id = $1`,
-        [ctx.supportRequestId, String(args.summary)]
-      );
-
-      return {
-        success: true,
-        escalated: true,
-        escalation_id: result.rows[0].id,
-        message: String(args.summary),
-      };
     }
 
     default:
@@ -330,26 +215,14 @@ export async function executeTool(
   }
 }
 
-const SYSTEM_PROMPT = `You are a support agent for an e-commerce store. Your job is to help customers with order issues.
-
-IMPORTANT RULES:
-1. Always look up order information before taking action.
-2. Verify the order belongs to the customer (lookup_order shows is_owner).
-3. Use the appropriate tool for refunds, cancellations, or replacements.
-4. Refunds and replacements typically require human approval — use request_refund or request_replacement.
-5. Cancellations can be auto-processed if the order hasn't shipped.
-6. If unsure, blocked by guardrails, or the request is ambiguous, use escalate_to_human.
-7. Never invent order IDs — always verify with lookup_order first.
-8. Be concise in your reasoning.
-
-Customer email is provided in context. Only act on orders belonging to this customer.`;
-
 export interface AgentRunResult {
   agentRunId: number;
   decision: 'auto_executed' | 'escalated' | 'no_action' | 'failed';
   reasoningSummary: string;
   outcome: string;
 }
+
+const MAX_AGENT_ITERATIONS = 10;
 
 export async function runAgentLoop(
   supportRequestId: number,
@@ -361,57 +234,64 @@ export async function runAgentLoop(
     [supportRequestId]
   );
 
-  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  const llmConfig = getLlmConfig();
+  const modelLabel = `${llmConfig.provider}:${llmConfig.model}`;
 
   const runResult = await pool.query(
     `INSERT INTO agent_runs (support_request_id, model, decision) VALUES ($1, $2, 'no_action') RETURNING id`,
-    [supportRequestId, model]
+    [supportRequestId, modelLabel]
   );
   const agentRunId = Number(runResult.rows[0].id);
-
   const ctx: ToolContext = { supportRequestId, agentRunId, customerEmail };
 
   const messages: ChatCompletionMessageParam[] = [
     { role: 'system', content: SYSTEM_PROMPT },
-    {
-      role: 'user',
-      content: `Customer email: ${customerEmail}\n\nCustomer message:\n${message}`,
-    },
+    { role: 'user', content: `Customer email: ${customerEmail}\n\nCustomer message:\n${message}` },
   ];
 
   let decision: AgentRunResult['decision'] = 'no_action';
   let reasoningSummary = '';
   let outcome = '';
-  const maxIterations = 10;
 
   try {
-    for (let i = 0; i < maxIterations; i++) {
-      const response = await openai.chat.completions.create({
-        model,
+    for (let i = 0; i < MAX_AGENT_ITERATIONS; i++) {
+      const response = await createChatCompletion({
+        model: llmConfig.model,
         messages,
         tools: AGENT_TOOLS,
-        tool_choice: 'auto',
       });
 
       const choice = response.choices[0];
       if (!choice) break;
 
       const assistantMessage = choice.message;
-      messages.push(assistantMessage);
+      messages.push({
+        role: 'assistant',
+        content: assistantMessage.content,
+        tool_calls: assistantMessage.tool_calls?.map((tc) => ({
+          id: tc.id,
+          type: 'function' as const,
+          function: { name: tc.function.name, arguments: tc.function.arguments },
+        })),
+      });
 
       if (assistantMessage.content) {
         reasoningSummary = assistantMessage.content;
       }
 
-      if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
+      if (!assistantMessage.tool_calls?.length) {
         outcome = assistantMessage.content || 'Agent completed without further action.';
         break;
       }
 
       for (const toolCall of assistantMessage.tool_calls) {
-        if (toolCall.type !== 'function') continue;
+        let args: Record<string, unknown> = {};
+        try {
+          args = JSON.parse(toolCall.function.arguments || '{}') as Record<string, unknown>;
+        } catch {
+          args = {};
+        }
 
-        const args = JSON.parse(toolCall.function.arguments || '{}') as Record<string, unknown>;
         const result = await executeTool(toolCall.function.name, args, ctx);
         await recordToolCall(agentRunId, toolCall.function.name, args, result);
 
@@ -469,4 +349,13 @@ export async function runAgentLoop(
     );
     return { agentRunId, decision: 'failed', reasoningSummary: errorMsg, outcome: errorMsg };
   }
+}
+
+/** Process agent in background — avoids HTTP timeout on long LLM runs (Render 30s limit). */
+export function scheduleAgentRun(supportRequestId: number, customerEmail: string, message: string): void {
+  setImmediate(() => {
+    runAgentLoop(supportRequestId, customerEmail, message).catch((err) => {
+      console.error(`Background agent failed for request ${supportRequestId}:`, err);
+    });
+  });
 }

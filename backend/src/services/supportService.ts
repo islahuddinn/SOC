@@ -1,15 +1,18 @@
 import type {
   AgentRun,
+  DashboardStats,
   Escalation,
+  EscalationDetail,
   Order,
   OrderItem,
   QueueItem,
+  RefundRecord,
   SupportRequest,
   SupportRequestDetail,
   ToolCallRecord,
 } from '@soc/shared';
 import { pool } from '../db/pool';
-import { runAgentLoop } from '../agent/agentLoop';
+import { scheduleAgentRun } from '../agent/agentLoop';
 
 function mapSupportRequest(row: Record<string, unknown>): SupportRequest {
   return {
@@ -58,15 +61,14 @@ function mapEscalation(row: Record<string, unknown>): Escalation {
 export async function createSupportRequest(
   customerEmail: string,
   message: string
-): Promise<{ request: SupportRequest; agentResult: Awaited<ReturnType<typeof runAgentLoop>> }> {
+): Promise<{ request: SupportRequest; processing: true }> {
   const result = await pool.query(
     `INSERT INTO support_requests (customer_email, message) VALUES ($1, $2) RETURNING *`,
     [customerEmail, message]
   );
   const request = mapSupportRequest(result.rows[0]);
-  const agentResult = await runAgentLoop(request.id, customerEmail, message);
-  const updated = await pool.query('SELECT * FROM support_requests WHERE id = $1', [request.id]);
-  return { request: mapSupportRequest(updated.rows[0]), agentResult };
+  scheduleAgentRun(request.id, customerEmail, message);
+  return { request, processing: true };
 }
 
 export async function getQueue(): Promise<QueueItem[]> {
@@ -167,14 +169,7 @@ export async function getSupportRequestDetail(id: number): Promise<SupportReques
   return { ...request, agent_runs, tool_calls, escalations };
 }
 
-export async function getEscalationDetail(id: number): Promise<{
-  escalation: Escalation;
-  supportRequest: SupportRequest;
-  agentRuns: AgentRun[];
-  toolCalls: ToolCallRecord[];
-  order: Order | null;
-  orderItems: OrderItem[];
-} | null> {
+export async function getEscalationDetail(id: number): Promise<EscalationDetail | null> {
   const escResult = await pool.query('SELECT * FROM escalations WHERE id = $1', [id]);
   if (escResult.rows.length === 0) return null;
 
@@ -228,12 +223,56 @@ export async function getPendingEscalations(): Promise<Escalation[]> {
   return result.rows.map(mapEscalation);
 }
 
-export async function getRefunds(): Promise<unknown[]> {
+export async function getRefunds(): Promise<RefundRecord[]> {
   const result = await pool.query(`
-    SELECT r.*, o.customer_email, o.total_amount as order_total
+    SELECT r.id, r.order_id, r.amount, r.status, r.created_at,
+           o.customer_email, o.total_amount as order_total
     FROM refunds r
     JOIN orders o ON r.order_id = o.id
     ORDER BY r.created_at DESC
   `);
-  return result.rows;
+  return result.rows.map((row) => ({
+    id: Number(row.id),
+    order_id: Number(row.order_id),
+    amount: Number(row.amount),
+    status: row.status as RefundRecord['status'],
+    customer_email: String(row.customer_email),
+    order_total: Number(row.order_total),
+    created_at: String(row.created_at),
+  }));
+}
+
+export async function getDashboardStats(): Promise<DashboardStats> {
+  const result = await pool.query(`
+    SELECT
+      (SELECT COUNT(*)::int FROM support_requests) AS total_requests,
+      (SELECT COUNT(*)::int FROM support_requests WHERE status = 'escalated') AS escalated,
+      (SELECT COUNT(*)::int FROM support_requests WHERE status = 'processing') AS processing,
+      (SELECT COUNT(*)::int FROM escalations WHERE status = 'pending') AS pending_reviews,
+      (SELECT COUNT(*)::int FROM refunds WHERE status = 'completed') AS completed_refunds,
+      (SELECT COUNT(*)::int FROM agent_runs WHERE decision = 'auto_executed') AS auto_executed
+  `);
+  const row = result.rows[0];
+  return {
+    total_requests: Number(row.total_requests),
+    escalated: Number(row.escalated),
+    processing: Number(row.processing),
+    pending_reviews: Number(row.pending_reviews),
+    completed_refunds: Number(row.completed_refunds),
+    auto_executed: Number(row.auto_executed),
+  };
+}
+
+export async function getOrders(): Promise<Order[]> {
+  const result = await pool.query('SELECT * FROM orders ORDER BY id ASC');
+  return result.rows.map((row) => ({
+    id: Number(row.id),
+    customer_email: String(row.customer_email),
+    customer_name: String(row.customer_name),
+    status: row.status as Order['status'],
+    total_amount: Number(row.total_amount),
+    refunded_amount: Number(row.refunded_amount),
+    shipped_at: row.shipped_at ? String(row.shipped_at) : null,
+    created_at: String(row.created_at),
+  }));
 }
